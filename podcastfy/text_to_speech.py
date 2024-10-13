@@ -8,12 +8,16 @@ including cleaning of input text and merging of audio files.
 
 import logging
 from elevenlabs import client as elevenlabs_client
-from podcastfy.utils.config import load_config
+from google.cloud import texttospeech
 from pydub import AudioSegment
 import os
 import re
 import openai
 from typing import List, Tuple, Optional, Union
+try:
+	from .utils.config import load_config
+except ImportError:
+	from utils.config import load_config
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +42,14 @@ class TextToSpeech:
 		elif self.model == 'openai':
 			self.api_key = api_key or self.config.OPENAI_API_KEY
 			openai.api_key = self.api_key
+		elif self.model == 'google':
+			# GOOGLE_APPLICATION_CREDENTIALS environment variable must be set with
+			# the path to the service account JSON file.
+			# REF: https://cloud.google.com/docs/authentication/application-default-credentials
+			self.api_key = None
+			self.client = texttospeech.TextToSpeechClient()
 		else:
-			raise ValueError("Invalid model. Choose 'elevenlabs' or 'openai'.")
+			raise ValueError("Invalid model. Choose 'elevenlabs', 'openai' or 'google'.")
 
 		self.audio_format = self.tts_config['audio_format']
 		self.temp_audio_dir = self.tts_config['temp_audio_dir']
@@ -96,6 +106,8 @@ class TextToSpeech:
 			self.__convert_to_speech_elevenlabs(cleaned_text, output_file)
 		elif self.model == 'openai':
 			self.__convert_to_speech_openai(cleaned_text, output_file)
+		elif self.model == 'google':
+			self.__convert_to_speech_google(cleaned_text, output_file)
 
 	def __convert_to_speech_elevenlabs(self, text: str, output_file: str) -> None:
 		try:
@@ -172,6 +184,57 @@ class TextToSpeech:
 		except Exception as e:
 			logger.error(f"Error converting text to speech with OpenAI: {str(e)}")
 			raise
+
+	def __convert_to_speech_google(self, text: str, output_file: str) -> None:
+		try:
+			qa_pairs = self.split_qa(text)
+			print(qa_pairs)
+			audio_files = []
+			counter = 0
+			question_voice = texttospeech.VoiceSelectionParams(
+				language_code=self.tts_config['google']['language_code'],
+				name=self.tts_config['google']['default_voices']['question']
+			)
+			answer_voice = texttospeech.VoiceSelectionParams(
+				language_code=self.tts_config['google']['language_code'],
+				name=self.tts_config['google']['default_voices']['answer']
+			)
+			audio_config = texttospeech.AudioConfig(
+				audio_encoding=texttospeech.AudioEncoding.MP3,
+				#speaking_rate=1.15, # not supported by Journey voices
+				#pitch=0.0, # not supported by Journey voices
+			)
+			for question, answer in qa_pairs:
+				for speaker, content in [
+					(question_voice, question),
+					(answer_voice, answer)
+				]:
+					counter += 1
+					synth_input = texttospeech.SynthesisInput(text=content)
+					file_name = f"{self.temp_audio_dir}{counter}.{self.audio_format}"
+					response = self.client.synthesize_speech(
+						input=synth_input,
+						voice=speaker,
+						audio_config=audio_config,
+					)
+					with open(file_name, "wb") as file:
+						file.write(response.audio_content)
+
+					audio_files.append(file_name)
+
+			# Merge all audio files and save the result
+			self.__merge_audio_files(self.temp_audio_dir, output_file)
+
+			# Clean up individual audio files
+			for file in audio_files:
+				os.remove(file)
+			
+			logger.info(f"Audio saved to {output_file}")
+
+		except Exception as e:
+			logger.error(f"Error converting text to speech with OpenAI: {str(e)}")
+			raise
+
 
 	def split_qa(self, input_text: str) -> List[Tuple[str, str]]:
 		"""
@@ -256,16 +319,25 @@ def main(seed: int = 42) -> None:
 			input_text = file.read()
 
 		# Test ElevenLabs
-		tts_elevenlabs = TextToSpeech(model='elevenlabs')
-		elevenlabs_output_file = 'tests/data/response_elevenlabs.mp3'
-		tts_elevenlabs.convert_to_speech(input_text, elevenlabs_output_file)
-		logger.info(f"ElevenLabs TTS completed. Output saved to {elevenlabs_output_file}")
+		if False:
+			tts_elevenlabs = TextToSpeech(model='elevenlabs')
+			elevenlabs_output_file = 'tests/data/response_elevenlabs.mp3'
+			tts_elevenlabs.convert_to_speech(input_text, elevenlabs_output_file)
+			logger.info(f"ElevenLabs TTS completed. Output saved to {elevenlabs_output_file}")
 
 		# Test OpenAI
-		tts_openai = TextToSpeech(model='openai')
-		openai_output_file = 'tests/data/response_openai.mp3'
-		tts_openai.convert_to_speech(input_text, openai_output_file)
-		logger.info(f"OpenAI TTS completed. Output saved to {openai_output_file}")
+		if False:
+			tts_openai = TextToSpeech(model='openai')
+			openai_output_file = 'tests/data/response_openai.mp3'
+			tts_openai.convert_to_speech(input_text, openai_output_file)
+			logger.info(f"OpenAI TTS completed. Output saved to {openai_output_file}")
+
+		# Test Google
+		if True:
+			tts_google = TextToSpeech(model='google')
+			google_output_file = 'tests/data/response_google.mp3'
+			tts_google.convert_to_speech(input_text, google_output_file)
+			logger.info(f"Google TTS completed. Output saved to {google_output_file}")
 
 	except Exception as e:
 		logger.error(f"An error occurred during text-to-speech conversion: {str(e)}")
