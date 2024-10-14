@@ -10,8 +10,10 @@ import logging
 from elevenlabs import client as elevenlabs_client
 from google.cloud import texttospeech
 from pydub import AudioSegment
+import io
 import os
 import re
+import random
 import openai
 from typing import List, Tuple, Optional, Union
 try:
@@ -20,6 +22,7 @@ except ImportError:
 	from utils.config import load_config
 
 logger = logging.getLogger(__name__)
+
 
 class TextToSpeech:
 	def __init__(self, model: str = 'openai', api_key: Optional[str] = None):
@@ -43,10 +46,9 @@ class TextToSpeech:
 			self.api_key = api_key or self.config.OPENAI_API_KEY
 			openai.api_key = self.api_key
 		elif self.model == 'google':
-			# GOOGLE_APPLICATION_CREDENTIALS environment variable must be set with
-			# the path to the service account JSON file.
+			# GOOGLE_APPLICATION_CREDENTIALS environment variable
+			# must be set with the path to the service account JSON file.
 			# REF: https://cloud.google.com/docs/authentication/application-default-credentials
-			self.api_key = None
 			self.client = texttospeech.TextToSpeechClient()
 		else:
 			raise ValueError("Invalid model. Choose 'elevenlabs', 'openai' or 'google'.")
@@ -188,53 +190,86 @@ class TextToSpeech:
 	def __convert_to_speech_google(self, text: str, output_file: str) -> None:
 		try:
 			qa_pairs = self.split_qa(text)
-			print(qa_pairs)
-			audio_files = []
-			counter = 0
+
+			combined_q = AudioSegment.empty()
+			combined_a = AudioSegment.empty()
+			tts_config = self.tts_config['google']
+
+			# configure the voices
 			question_voice = texttospeech.VoiceSelectionParams(
-				language_code=self.tts_config['google']['language_code'],
-				name=self.tts_config['google']['default_voices']['question']
+				language_code=tts_config.get('language_code', 'en-US'),
+				name=tts_config['default_voices']['question']['voice'],
 			)
 			answer_voice = texttospeech.VoiceSelectionParams(
-				language_code=self.tts_config['google']['language_code'],
-				name=self.tts_config['google']['default_voices']['answer']
+				language_code=tts_config.get('language_code', 'en-US'),
+				name=tts_config['default_voices']['answer']['voice'],
 			)
-			audio_config = texttospeech.AudioConfig(
-				audio_encoding=texttospeech.AudioEncoding.MP3,
-				#speaking_rate=1.15, # not supported by Journey voices
-				#pitch=0.0, # not supported by Journey voices
-			)
+			last_overlap_duration = 0.0
 			for question, answer in qa_pairs:
-				for speaker, content in [
-					(question_voice, question),
-					(answer_voice, answer)
+				for kind, content, speaker in [
+					('question', question, question_voice),
+					('answer', answer, answer_voice),
 				]:
-					counter += 1
-					synth_input = texttospeech.SynthesisInput(text=content)
-					file_name = f"{self.temp_audio_dir}{counter}.{self.audio_format}"
+					voice_config = tts_config['default_voices'][kind]
+					
+					# configure the audio output
+					config_kwargs = dict(
+						audio_encoding=texttospeech.AudioEncoding.OGG_OPUS,
+						speaking_rate=voice_config.get('rate'),
+						pitch=voice_config.get('pitch'),
+					)
+					# apply random variation to speaking_rate and pitch
+					if config_kwargs['speaking_rate']:
+						config_kwargs['speaking_rate'] *= random.uniform(0.95, 1.2)  # TODO: make this configurable
+					if config_kwargs['pitch']:
+						config_kwargs['pitch'] += random.uniform(-2, 2)	 # TODO: make this configurable
+					# remove None values from config_kwargs (required by some voices)
+					audio_config = texttospeech.AudioConfig(
+						**{k: v for k, v in config_kwargs.items() if v is not None}
+					)
+
+					# configure the synthesis input
+					use_text_input = 'Journey' in voice_config['voice']  # UGLY
+					synth_input_type = 'text' if use_text_input else 'ssml'
+					synth_input = texttospeech.SynthesisInput(**{synth_input_type: content})
+					
+					# get audio content from the TTS service
 					response = self.client.synthesize_speech(
 						input=synth_input,
 						voice=speaker,
 						audio_config=audio_config,
 					)
-					with open(file_name, "wb") as file:
-						file.write(response.audio_content)
 
-					audio_files.append(file_name)
-
-			# Merge all audio files and save the result
-			self.__merge_audio_files(self.temp_audio_dir, output_file)
-
-			# Clean up individual audio files
-			for file in audio_files:
-				os.remove(file)
+					# generate silent audio segment for the other speaker
+					overlap_duration = random.uniform(0.2, 0.4)  # TODO: make this configurable
+					audio_segment = AudioSegment.from_file(io.BytesIO(response.audio_content), format='ogg')
+					duration_seconds = audio_segment.duration_seconds
+					silence_duration = duration_seconds - overlap_duration - last_overlap_duration
+					last_overlap_duration = overlap_duration
+					silence = AudioSegment.silent(duration=silence_duration * 1000)
+					
+					# add audio segments to each speaker
+					if kind == 'question':
+						combined_q += audio_segment
+						combined_a += silence
+					else:
+						combined_q += silence
+						combined_a += audio_segment
 			
+			# add silence for the last overlap
+			combined_q += AudioSegment.silent(duration=last_overlap_duration * 1000)
+
+			# export speaker audio segments to separate files
+			combined_q.export(output_file.replace('.mp3', '_question.mp3'), format=self.audio_format)
+			combined_a.export(output_file.replace('.mp3', '_answer.mp3'), format=self.audio_format)
+			# merge speaker audio segments and save the result
+			combined_q.overlay(combined_a).export(output_file, format=self.audio_format)
+
 			logger.info(f"Audio saved to {output_file}")
 
 		except Exception as e:
 			logger.error(f"Error converting text to speech with OpenAI: {str(e)}")
 			raise
-
 
 	def split_qa(self, input_text: str) -> List[Tuple[str, str]]:
 		"""
@@ -303,6 +338,7 @@ class TextToSpeech:
 
 		return cleaned_text.strip()
 
+
 def main(seed: int = 42) -> None:
 	"""
 	Main function to test the TextToSpeech class.
@@ -311,37 +347,22 @@ def main(seed: int = 42) -> None:
 		seed (int): Random seed for reproducibility. Defaults to 42.
 	"""
 	try:
-		# Load configuration
-		config = load_config()
-
 		# Read input text from file
-		with open('tests/data/transcript_336aa9f955cd4019bc1287379a5a2820.txt', 'r') as file:
+		transcript_path = 'tests/data/transcript_336aa9f955cd4019bc1287379a5a2820.txt'
+		with open(transcript_path, 'r') as file:
 			input_text = file.read()
-
-		# Test ElevenLabs
-		if False:
-			tts_elevenlabs = TextToSpeech(model='elevenlabs')
-			elevenlabs_output_file = 'tests/data/response_elevenlabs.mp3'
-			tts_elevenlabs.convert_to_speech(input_text, elevenlabs_output_file)
-			logger.info(f"ElevenLabs TTS completed. Output saved to {elevenlabs_output_file}")
-
-		# Test OpenAI
-		if False:
-			tts_openai = TextToSpeech(model='openai')
-			openai_output_file = 'tests/data/response_openai.mp3'
-			tts_openai.convert_to_speech(input_text, openai_output_file)
-			logger.info(f"OpenAI TTS completed. Output saved to {openai_output_file}")
-
-		# Test Google
-		if True:
-			tts_google = TextToSpeech(model='google')
-			google_output_file = 'tests/data/response_google.mp3'
-			tts_google.convert_to_speech(input_text, google_output_file)
-			logger.info(f"Google TTS completed. Output saved to {google_output_file}")
+		
+		# generate audio for each model
+		for model in ['elevenlabs', 'openai', 'google']:
+			tts = TextToSpeech(model=model)
+			output_file = f'tests/data/response_{model}.mp3'
+			tts.convert_to_speech(input_text, output_file)
+			logger.info(f"{model.capitalize()} TTS completed. Output saved to {output_file}")
 
 	except Exception as e:
 		logger.error(f"An error occurred during text-to-speech conversion: {str(e)}")
 		raise
+
 
 if __name__ == "__main__":
 	main(seed=42)
